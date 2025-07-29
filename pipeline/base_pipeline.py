@@ -4,6 +4,7 @@ from web3 import Web3
 from web3.middleware import ExtraDataToPOAMiddleware
 from dotenv import load_dotenv
 import requests
+from typing import List, Dict, Any
 
 # --- 1. SETUP & CONNECTIONS ---
 
@@ -26,6 +27,11 @@ if not w3.is_connected():
 
 print(f"✅ Successfully connected to Base network (Chain ID: {w3.eth.chain_id})")
 
+# The event signature for an ERC-20 Transfer is: Transfer(address,address,uint256)
+# We need its Keccak-256 hash to identify these events in the transaction logs.
+TRANSFER_EVENT_TOPIC = w3.keccak(text="Transfer(address,address,uint256)").to_0x_hex()
+print(f"ERC-20 Transfer Event Topic: {TRANSFER_EVENT_TOPIC}")
+
 # --- 2. CORE DATA FETCHING LOGIC ---
 
 def get_receipts_for_block(block_number):
@@ -41,9 +47,6 @@ def get_receipts_for_block(block_number):
     """
     print(f"\nAttempting to fetch receipts for block: {block_number}...")
     try:
-        # This is a non-standard, but common, JSON-RPC method.
-        # The exact name can vary ('eth_getBlockReceipts', 'alchemy_getTransactionReceipts', etc.)
-        # We'll use a generic payload structure.
         payload = json.dumps({
             "method": "eth_getBlockReceipts",
             "params": [
@@ -57,7 +60,6 @@ def get_receipts_for_block(block_number):
         }
 
         response = requests.request("POST", QUICKNODE_URL, headers=headers, data=payload)
-
         #response = requests.post(QUICKNODE_URL, json=payload)
         response.raise_for_status() # Raise an exception for bad status codes
         
@@ -85,11 +87,55 @@ def get_receipts_for_block(block_number):
         print("❌ Failed to decode JSON from the response.")
         return None
 
-# --- 3. MAIN EXECUTION ---
+def parse_transfers_from_receipts(receipts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Parses a list of transaction receipts to find and decode ERC-20 Transfer events.
+    """
+    print(f"\nParsing {len(receipts)} receipts for ERC-20 transfers...")
+    decoded_transfers = []
+
+    for receipt in receipts:
+        # Each receipt has a 'logs' array
+        for log in receipt.get('logs', []):
+            # A log's 'topics' array contains indexed event parameters.
+            # For an ERC-20 Transfer, topic[0] is the event signature.
+            if log['topics'] and log['topics'][0] == TRANSFER_EVENT_TOPIC:
+                try:
+                    # The 'from' and 'to' addresses are the 2nd and 3rd topics.
+                    # They are 32 bytes long, so we slice the last 20 bytes for the address.
+                    from_address = Web3.to_checksum_address('0x' + log['topics'][1][-40:])
+                    to_address = Web3.to_checksum_address('0x' + log['topics'][2][-40:])
+                    
+                    # The 'value' is in the 'data' field, which is not indexed.
+                    # It's a hex string representing a uint256.
+                    value = int(log['data'], 16)
+                    
+                    # The address of the token contract that emitted this event
+                    token_contract = Web3.to_checksum_address(log['address'])
+
+                    transfer_data = {
+                        "blockNumber": int(receipt['blockNumber'], 16),
+                        "transactionHash": receipt['transactionHash'],
+                        "logIndex": int(log['logIndex'], 16),
+                        "tokenContract": token_contract,
+                        "fromAddress": from_address,
+                        "toAddress": to_address,
+                        "value": str(value) # Store as string to handle large numbers
+                    }
+                    decoded_transfers.append(transfer_data)
+                except Exception as e:
+                    # This can happen with non-standard ERC-20 contracts
+                    print(f"⚠️ Could not decode a potential transfer log. Error: {e}")
+
+    print(f"✅ Decoded {len(decoded_transfers)} transfer events.")
+    return decoded_transfers
+
+
+# --- MAIN EXECUTION ---
 
 if __name__ == "__main__":
     try:
-        # Get the latest block number from the chain
+
         latest_block_number = w3.eth.block_number
         print(f"Latest block on Base: {latest_block_number}")
 
@@ -97,16 +143,16 @@ if __name__ == "__main__":
         receipts = get_receipts_for_block(latest_block_number)
 
         if receipts:
-            # For now, we'll just save the raw receipts to a file to inspect them.
-            # In the next steps, we will parse this data.
-            output_filename = f"receipts_block_{latest_block_number}.json"
+            # Parse raw data into structured transfers
+            transfers = parse_transfers_from_receipts(receipts)
             
-            with open(output_filename, 'w') as f:
-                json.dump(receipts, f, indent=2)
+            if transfers:
+                output_filename = f"transfers_block_{latest_block_number}.json"
             
-            print(f"\nSuccessfully saved raw receipt data to '{output_filename}'")
-            print("Next step: Parse these receipts to extract token transfers and swaps.")
+                with open(output_filename, 'w') as f:
+                    json.dump(transfers, f, indent=2)
+            
+                print(f"\nSuccessfully saved structured transfer data to '{output_filename}'")
 
     except Exception as e:
         print(f"\nAn unexpected error occurred: {e}")
-
