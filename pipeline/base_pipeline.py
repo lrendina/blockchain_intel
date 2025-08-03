@@ -4,7 +4,7 @@ from web3 import Web3
 from web3.middleware import ExtraDataToPOAMiddleware
 from dotenv import load_dotenv
 import requests
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 # --- 1. SETUP & CONNECTIONS ---
 
@@ -29,7 +29,11 @@ print(f"✅ Successfully connected to Base network (Chain ID: {w3.eth.chain_id})
 
 # The event signature for an ERC-20 Transfer is: Transfer(address,address,uint256)
 # We need its Keccak-256 hash to identify these events in the transaction logs.
+# --- CONSTANTS & CACHE ---
 TRANSFER_EVENT_TOPIC = w3.keccak(text="Transfer(address,address,uint256)").to_0x_hex()
+ERC20_ABI = json.loads('[{"constant":true,"inputs":[],"name":"name","outputs":[{"name":"","type":"string"}],"payable":false,"stateMutability":"view","type":"function"},{"constant":true,"inputs":[],"name":"symbol","outputs":[{"name":"","type":"string"}],"payable":false,"stateMutability":"view","type":"function"},{"constant":true,"inputs":[],"name":"decimals","outputs":[{"name":"","type":"uint8"}],"payable":false,"stateMutability":"view","type":"function"}]')
+# In-memory cache to store token metadata and avoid redundant RPC calls.
+TOKEN_METADATA_CACHE: Dict[str, Dict[str, Any]] = {}
 print(f"ERC-20 Transfer Event Topic: {TRANSFER_EVENT_TOPIC}")
 
 # --- 2. CORE DATA FETCHING LOGIC ---
@@ -105,10 +109,15 @@ def parse_transfers_from_receipts(receipts: List[Dict[str, Any]]) -> List[Dict[s
                     # They are 32 bytes long, so we slice the last 20 bytes for the address.
                     from_address = Web3.to_checksum_address('0x' + log['topics'][1][-40:])
                     to_address = Web3.to_checksum_address('0x' + log['topics'][2][-40:])
+
+                    log_data = log.get('data', '0x')
+                    if log_data == '0x':
+                        value = 0
+                    else:
+                        value = int(log_data, 16)
                     
                     # The 'value' is in the 'data' field, which is not indexed.
                     # It's a hex string representing a uint256.
-                    value = int(log['data'], 16)
                     
                     # The address of the token contract that emitted this event
                     token_contract = Web3.to_checksum_address(log['address'])
