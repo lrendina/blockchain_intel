@@ -1,0 +1,7 @@
+.env
+transfers/
+traders/
+run.py
+test.ipynb
+coin_list.json
+ingest.ipynb
