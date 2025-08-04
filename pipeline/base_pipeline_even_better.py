@@ -179,7 +179,7 @@ def get_historical_price(coingecko_id: Optional[str], date_str: str) -> Optional
         data = response.json()
         price = data.get('market_data', {}).get('current_price', {}).get('usd')
         PRICE_CACHE[cache_key] = price
-        time.sleep(1.5) # Respect CoinGecko's free tier rate limit
+        time.sleep(1.5) #  CoinGecko's free tier rate limit
         return price
     except Exception:
         PRICE_CACHE[cache_key] = None
@@ -206,7 +206,6 @@ if __name__ == "__main__":
                     json.dump(enriched_transfers, f, indent=2)
                 
                 print(f"\nSuccessfully saved fully enriched data to '{output_filename}'")
-                print("This data is now ready for analysis and storage in a database.")
 
     except Exception as e:
         print(f"\nAn unexpected error occurred: {e}")
