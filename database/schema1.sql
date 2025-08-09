@@ -382,3 +382,65 @@ CREATE INDEX IF NOT EXISTS idx_evm_syncs_tx
 CREATE INDEX IF NOT EXISTS idx_evm_syncs_contract 
     ON evm_syncs USING btree (contract_address, chain);
 
+
+-- Trader Intelligence additions: token_transfers, dex_swaps, and pipeline_state
+
+-- Holds ERC-20 Transfer events enriched by the Base pipeline
+CREATE TABLE IF NOT EXISTS token_transfers (
+    transaction_hash VARCHAR(128) NOT NULL,
+    log_index INT NOT NULL,
+    block_number BIGINT NOT NULL,
+    timestamp BIGINT NOT NULL,
+    chain VARCHAR(20) NOT NULL DEFAULT 'base',
+    token_contract VARCHAR(64) NOT NULL,
+    token_symbol VARCHAR(100),
+    from_address VARCHAR(64) NOT NULL,
+    to_address VARCHAR(64) NOT NULL,
+    value NUMERIC(78, 36),
+    usd_value NUMERIC(38, 8),
+    CONSTRAINT pk_token_transfers PRIMARY KEY (transaction_hash, log_index)
+);
+
+-- Helpful indexes for analytics
+CREATE INDEX IF NOT EXISTS idx_token_transfers_timestamp
+    ON token_transfers USING brin (timestamp) WITH (pages_per_range = 128);
+CREATE INDEX IF NOT EXISTS idx_token_transfers_token
+    ON token_transfers USING btree (token_contract, chain);
+CREATE INDEX IF NOT EXISTS idx_token_transfers_from
+    ON token_transfers USING btree (from_address, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_token_transfers_to
+    ON token_transfers USING btree (to_address, timestamp DESC);
+
+
+-- Placeholder for DEX swap events (future extension)
+CREATE TABLE IF NOT EXISTS dex_swaps (
+    transaction_hash VARCHAR(128) NOT NULL,
+    log_index INT NOT NULL,
+    block_number BIGINT NOT NULL,
+    timestamp BIGINT NOT NULL,
+    chain VARCHAR(20) NOT NULL DEFAULT 'base',
+    pool_contract VARCHAR(64) NOT NULL,
+    token_in_contract VARCHAR(64) NOT NULL,
+    token_in_symbol VARCHAR(100),
+    amount_in NUMERIC(78, 36),
+    usd_value_in NUMERIC(38, 8),
+    token_out_contract VARCHAR(64) NOT NULL,
+    token_out_symbol VARCHAR(100),
+    amount_out NUMERIC(78, 36),
+    usd_value_out NUMERIC(38, 8),
+    CONSTRAINT pk_dex_swaps PRIMARY KEY (transaction_hash, log_index)
+);
+
+CREATE INDEX IF NOT EXISTS idx_dex_swaps_timestamp
+    ON dex_swaps USING brin (timestamp) WITH (pages_per_range = 128);
+CREATE INDEX IF NOT EXISTS idx_dex_swaps_pool
+    ON dex_swaps USING btree (pool_contract, chain);
+CREATE INDEX IF NOT EXISTS idx_dex_swaps_tokens
+    ON dex_swaps USING btree (token_in_contract, token_out_contract, chain);
+
+
+-- Tracks last processed block for each chain for robust restarts
+CREATE TABLE IF NOT EXISTS pipeline_state (
+    chain VARCHAR(20) PRIMARY KEY,
+    last_processed_block BIGINT NOT NULL
+);
