@@ -46,11 +46,14 @@ CHAIN = "base"
 CONFIRMATIONS = 5  # avoid reorgs
 REQUEST_TIMEOUT = 20  # seconds
 COIN_LIST_CACHE_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "coin_list.json")
+UNIV2_SWAP_TOPIC = w3.keccak(text="Swap(address,uint256,uint256,uint256,uint256,address)").to_0x_hex()
+UNIV3_SWAP_TOPIC = w3.keccak(text="Swap(address,address,int256,int256,uint160,uint128,int24)").to_0x_hex()
 
 # Caches to minimize external API calls
 TOKEN_METADATA_CACHE: Dict[str, Optional[Dict[str, Any]]] = {}
 PRICE_CACHE: Dict[str, Optional[float]] = {}
 ADDRESS_TO_ID_MAP: Dict[str, str] = {}
+POOL_TOKEN_CACHE: Dict[str, Optional[Dict[str, str]]] = {}
 
 # --- DATABASE CONNECTION ---
 def get_db_connection():
@@ -210,13 +213,24 @@ def get_block_with_receipts(block_number: int) -> Optional[Dict[str, Any]]:
         if "error" in data:
             print(f"❌ RPC Error: {data['error']['message']}")
             return None
-        # get block timestamp (retry via web3 if needed)
-        block_info = w3.eth.get_block(block_number)
-        result = {"receipts": data.get("result", []), "timestamp": block_info['timestamp']}
-        print(f"✅ Found {len(result['receipts'])} receipts for block {block_number}.")
-        return result
+        receipts = data.get('result')
+        if receipts is None:
+            print(f"No receipts returned for block {block_number}.")
+            return None
+        # Fetch block timestamp for enrichment
+        try:
+            b = w3.eth.get_block(block_number)
+            ts = int(b.timestamp)
+        except Exception:
+            ts = int(time.time())
+        print(f"✅ Found {len(receipts)} receipts for block {block_number}.")
+        return {
+            'blockNumber': block_number,
+            'timestamp': ts,
+            'receipts': receipts
+        }
     except Exception as e:
-        print(f"❌ Error in get_block_with_receipts: {e}")
+        print(f"❌ Failed to fetch receipts for block {block_number}: {e}")
         return None
 
 # --- DATA PARSING & ENRICHMENT ---
@@ -318,6 +332,173 @@ def get_historical_price(coingecko_id: Optional[str], date_str: str) -> Optional
         PRICE_CACHE[cache_key] = None
         return None
 
+def get_pool_tokens(pool_address: str) -> Optional[Dict[str, str]]:
+    """Fetch and cache token0/token1 addresses for a given pool (V2/V3/Velodrome-like)."""
+    if pool_address in POOL_TOKEN_CACHE:
+        return POOL_TOKEN_CACHE[pool_address]
+    try:
+        minimal_pool_abi = json.loads('[{"inputs":[],"name":"token0","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"token1","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"}]')
+        contract = w3.eth.contract(address=pool_address, abi=minimal_pool_abi)
+        t0 = contract.functions.token0().call()
+        t1 = contract.functions.token1().call()
+        res = { 'token0': Web3.to_checksum_address(t0), 'token1': Web3.to_checksum_address(t1) }
+        POOL_TOKEN_CACHE[pool_address] = res
+        return res
+    except Exception:
+        POOL_TOKEN_CACHE[pool_address] = None
+        return None
+
+def parse_and_enrich_swaps(block_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Parse common DEX swap events (Uniswap V2/Solidly-style and Uniswap V3) and enrich with metadata and USD values."""
+    receipts = block_data.get('receipts', [])
+    block_number = int(block_data.get('blockNumber'))
+    # estimate date for pricing from block timestamp via first tx (fallback to today)
+    date_str = datetime.utcnow().strftime('%d-%m-%Y')
+    swaps: List[Dict[str, Any]] = []
+    try:
+        # Best-effort fetch of block timestamp via eth_getBlockByNumber (fast, single call)
+        b = w3.eth.get_block(block_number)
+        block_ts = int(b.timestamp)
+        date_str = datetime.utcfromtimestamp(block_ts).strftime('%d-%m-%Y')
+    except Exception:
+        pass
+
+    for receipt in receipts:
+        tx_hash = receipt.get('transactionHash')
+        logs = receipt.get('logs', [])
+        for log in logs:
+            try:
+                topic0 = log.get('topics', [None])[0]
+                addr = log.get('address')
+                if not addr:
+                    continue
+                try:
+                    pool_addr = Web3.to_checksum_address(addr)
+                except Exception:
+                    continue
+                log_index_hex = log.get('logIndex') or log.get('log_index')
+                if log_index_hex is None:
+                    continue
+                log_index = int(log_index_hex, 16) if isinstance(log_index_hex, str) and log_index_hex.startswith('0x') else int(log_index_hex)
+
+                # Uniswap V2 / Velodrome / Solidly style
+                if topic0 == UNIV2_SWAP_TOPIC:
+                    # data encodes: amount0In, amount1In, amount0Out, amount1Out (uint256 x4)
+                    data_hex = log.get('data', '0x')
+                    raw = bytes.fromhex(data_hex[2:]) if data_hex.startswith('0x') else bytes()
+                    if len(raw) >= 32*4:
+                        amounts = w3.codec.decode_abi(['uint256','uint256','uint256','uint256'], raw)
+                        amount0_in, amount1_in, amount0_out, amount1_out = [Decimal(int(x)) for x in amounts]
+                    else:
+                        continue
+                    tokens = get_pool_tokens(pool_addr)
+                    if not tokens:
+                        continue
+                    token0 = tokens['token0']; token1 = tokens['token1']
+                    # decide direction
+                    if amount0_in > 0:
+                        token_in, token_out = token0, token1
+                        amt_in, amt_out = amount0_in, amount1_out
+                    else:
+                        token_in, token_out = token1, token0
+                        amt_in, amt_out = amount1_in, amount0_out
+
+                    # metadata and normalization
+                    meta_in = get_token_metadata(token_in) or {}
+                    meta_out = get_token_metadata(token_out) or {}
+                    dec_in = int(meta_in.get('decimals', 18))
+                    dec_out = int(meta_out.get('decimals', 18))
+                    sym_in = meta_in.get('symbol')
+                    sym_out = meta_out.get('symbol')
+                    norm_in = amt_in / (Decimal(10) ** dec_in) if amt_in is not None else None
+                    norm_out = amt_out / (Decimal(10) ** dec_out) if amt_out is not None else None
+
+                    # USD valuation
+                    cg_in = ADDRESS_TO_ID_MAP.get(token_in)
+                    cg_out = ADDRESS_TO_ID_MAP.get(token_out)
+                    price_in = get_historical_price(cg_in, date_str)
+                    price_out = get_historical_price(cg_out, date_str)
+                    usd_in = (norm_in * Decimal(str(price_in))) if (norm_in is not None and price_in is not None) else None
+                    usd_out = (norm_out * Decimal(str(price_out))) if (norm_out is not None and price_out is not None) else None
+
+                    swaps.append({
+                        'transactionHash': tx_hash,
+                        'logIndex': log_index,
+                        'blockNumber': block_number,
+                        'timestamp': int(b.timestamp) if 'b' in locals() else int(time.time()),
+                        'chain': CHAIN,
+                        'poolContract': pool_addr,
+                        'tokenInContract': token_in,
+                        'tokenInSymbol': sym_in,
+                        'amountIn': norm_in,
+                        'usdValueIn': usd_in,
+                        'tokenOutContract': token_out,
+                        'tokenOutSymbol': sym_out,
+                        'amountOut': norm_out,
+                        'usdValueOut': usd_out,
+                    })
+
+                # Uniswap V3 style
+                elif topic0 == UNIV3_SWAP_TOPIC:
+                    data_hex = log.get('data', '0x')
+                    raw = bytes.fromhex(data_hex[2:]) if data_hex.startswith('0x') else bytes()
+                    if len(raw) >= 32*5:  # amounts and other fields
+                        # amount0 (int256), amount1 (int256) are first two
+                        amount0, amount1 = w3.codec.decode_abi(['int256','int256'], raw[:64*2])
+                        amount0 = Decimal(int(amount0))
+                        amount1 = Decimal(int(amount1))
+                    else:
+                        continue
+                    tokens = get_pool_tokens(pool_addr)
+                    if not tokens:
+                        continue
+                    token0 = tokens['token0']; token1 = tokens['token1']
+                    # In V3, positive amount means to the pool (in), negative means out from pool
+                    if amount0 > 0:
+                        token_in, token_out = token0, token1
+                        amt_in, amt_out = amount0, -amount1
+                    else:
+                        token_in, token_out = token1, token0
+                        amt_in, amt_out = amount1, -amount0
+
+                    meta_in = get_token_metadata(token_in) or {}
+                    meta_out = get_token_metadata(token_out) or {}
+                    dec_in = int(meta_in.get('decimals', 18))
+                    dec_out = int(meta_out.get('decimals', 18))
+                    sym_in = meta_in.get('symbol')
+                    sym_out = meta_out.get('symbol')
+                    norm_in = amt_in / (Decimal(10) ** dec_in) if amt_in is not None else None
+                    norm_out = amt_out / (Decimal(10) ** dec_out) if amt_out is not None else None
+
+                    cg_in = ADDRESS_TO_ID_MAP.get(token_in)
+                    cg_out = ADDRESS_TO_ID_MAP.get(token_out)
+                    price_in = get_historical_price(cg_in, date_str)
+                    price_out = get_historical_price(cg_out, date_str)
+                    usd_in = (norm_in * Decimal(str(price_in))) if (norm_in is not None and price_in is not None) else None
+                    usd_out = (norm_out * Decimal(str(price_out))) if (norm_out is not None and price_out is not None) else None
+
+                    swaps.append({
+                        'transactionHash': tx_hash,
+                        'logIndex': log_index,
+                        'blockNumber': block_number,
+                        'timestamp': int(b.timestamp) if 'b' in locals() else int(time.time()),
+                        'chain': CHAIN,
+                        'poolContract': pool_addr,
+                        'tokenInContract': token_in,
+                        'tokenInSymbol': sym_in,
+                        'amountIn': norm_in,
+                        'usdValueIn': usd_in,
+                        'tokenOutContract': token_out,
+                        'tokenOutSymbol': sym_out,
+                        'amountOut': norm_out,
+                        'usdValueOut': usd_out,
+                    })
+
+            except Exception:
+                continue
+
+    return swaps
+
 # --- MAIN EXECUTION ---
 
 def get_last_processed_block(conn, chain: str) -> Optional[int]:
@@ -369,7 +550,9 @@ if __name__ == "__main__":
                 enriched_transfers = parse_and_enrich_transfers(block_data)
                 if enriched_transfers:
                     insert_transfers(db_conn, enriched_transfers)
-                # TODO: parse swaps from receipts and insert via insert_swaps
+                enriched_swaps = parse_and_enrich_swaps(block_data)
+                if enriched_swaps:
+                    insert_swaps(db_conn, enriched_swaps)
                 set_last_processed_block(db_conn, CHAIN, block_number)
                 print(f"Processed block {block_number}.")
 
