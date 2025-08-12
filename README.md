@@ -1,4 +1,4 @@
-# Trader Intelligence – Docker Workflow
+# Intel gathering pipeline
 
 This project ingests, enriches, and stores Base blockchain data into Postgres. The canonical local setup uses Docker.
 
