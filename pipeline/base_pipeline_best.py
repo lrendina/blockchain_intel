@@ -5,7 +5,7 @@ from web3.middleware import ExtraDataToPOAMiddleware
 from dotenv import load_dotenv
 import requests
 from typing import List, Dict, Any, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 import time
 import psycopg2
 from psycopg2.extras import execute_batch
@@ -47,13 +47,45 @@ CONFIRMATIONS = 5  # avoid reorgs
 REQUEST_TIMEOUT = 20  # seconds
 COIN_LIST_CACHE_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "coin_list.json")
 UNIV2_SWAP_TOPIC = w3.keccak(text="Swap(address,uint256,uint256,uint256,uint256,address)").to_0x_hex()
+UNIV2_SWAP_TOPIC_ALT = w3.keccak(text="Swap(address,address,uint256,uint256,uint256,uint256)").to_0x_hex()
 UNIV3_SWAP_TOPIC = w3.keccak(text="Swap(address,address,int256,int256,uint160,uint128,int24)").to_0x_hex()
+
+# Output sink configuration
+PIPELINE_SINK = os.getenv('PIPELINE_SINK', 'db').lower()  # db | csv | both
+USE_DB = 'db' in PIPELINE_SINK
+USE_CSV = 'csv' in PIPELINE_SINK or PIPELINE_SINK == 'both'
+OUTPUT_DIR = os.getenv('OUTPUT_DIR', os.path.join(os.path.dirname(os.path.dirname(__file__)), 'output'))
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# Price enrichment mode: inline (default) or deferred
+PRICE_MODE = os.getenv('PRICE_MODE', 'inline').lower()  # inline | deferred
+DEFER_PRICES = PRICE_MODE == 'deferred'
+
+# CSV column orders matching DB schema
+CSV_COLUMNS_TRANSFERS = [
+    'blockNumber','timestamp','chain','transactionHash','logIndex',
+    'tokenContract','tokenSymbol','fromAddress','toAddress','value','usdValue'
+]
+CSV_COLUMNS_SWAPS = [
+    'blockNumber','timestamp','chain','transactionHash','logIndex','poolContract',
+    'tokenInContract','tokenInSymbol','amountIn','usdValueIn',
+    'tokenOutContract','tokenOutSymbol','amountOut','usdValueOut'
+]
+
+# CSV schemas for registry/queue
+CSV_COLUMNS_TOKENS = [
+    'tokenContract','symbol','decimals','firstSeenBlock','firstSeenAt'
+]
+CSV_COLUMNS_PRICE_TASKS = [
+    'tokenContract','date'
+]
 
 # Caches to minimize external API calls
 TOKEN_METADATA_CACHE: Dict[str, Optional[Dict[str, Any]]] = {}
 PRICE_CACHE: Dict[str, Optional[float]] = {}
 ADDRESS_TO_ID_MAP: Dict[str, str] = {}
 POOL_TOKEN_CACHE: Dict[str, Optional[Dict[str, str]]] = {}
+PRICE_TASKS_SET = set()  # in-memory dedupe per run
 
 # --- DATABASE CONNECTION ---
 def get_db_connection():
@@ -72,71 +104,91 @@ def get_db_connection():
         print(f"❌ Could not connect to the database: {e}")
         return None
 
-def insert_transfers(conn, transfers: List[Dict[str, Any]]):
-    """Batch inserts transfer data into the token_transfers table."""
+def insert_transfers(conn, block_number: int, transfers: List[Dict[str, Any]]):
+    """Write transfers to DB and/or CSV according to PIPELINE_SINK."""
     if not transfers:
         return
-    query = """
-        INSERT INTO token_transfers (
-            transaction_hash, log_index, block_number, timestamp, chain,
-            token_contract, token_symbol, from_address, to_address, value, usd_value
-        )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (transaction_hash, log_index) DO NOTHING;
-    """
-    data_to_insert = []
-    for t in transfers:
-        data_to_insert.append(
-            (
-                t['transactionHash'],
-                int(t['logIndex']),
-                int(t['blockNumber']),
-                int(t['timestamp']),
-                t.get('chain', CHAIN),
-                t['tokenContract'],
-                t.get('tokenSymbol'),
-                t['fromAddress'],
-                t['toAddress'],
-                Decimal(str(t.get('value'))) if t.get('value') is not None else None,
-                Decimal(str(t.get('usdValue'))) if t.get('usdValue') is not None else None,
+    # CSV
+    if USE_CSV:
+        transfers_csv_path = os.path.join(OUTPUT_DIR, f'token_transfers_{block_number}.csv')
+        write_csv(transfers_csv_path, transfers, CSV_COLUMNS_TRANSFERS)
+        print(f"📝 Wrote {len(transfers)} transfer records to {transfers_csv_path}.")
+    # DB
+    if USE_DB and conn:
+        query = """
+            INSERT INTO token_transfers (
+                transaction_hash, log_index, block_number, timestamp, chain,
+                token_contract, token_symbol, from_address, to_address, value, usd_value
             )
-        )
-    with conn.cursor() as cursor:
-        execute_batch(cursor, query, data_to_insert)
-    conn.commit()
-    print(f"✅ Inserted {len(data_to_insert)} records into token_transfers.")
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (transaction_hash, log_index) DO NOTHING;
+        """
+        data_to_insert = []
+        for t in transfers:
+            data_to_insert.append(
+                (
+                    t['transactionHash'],
+                    int(t['logIndex']),
+                    int(t['blockNumber']),
+                    int(t['timestamp']),
+                    t.get('chain', CHAIN),
+                    t['tokenContract'],
+                    t.get('tokenSymbol'),
+                    t['fromAddress'],
+                    t['toAddress'],
+                    Decimal(str(t.get('value'))) if t.get('value') is not None else None,
+                    Decimal(str(t.get('usdValue'))) if t.get('usdValue') is not None else None,
+                )
+            )
+        with conn.cursor() as cursor:
+            execute_batch(cursor, query, data_to_insert)
+        conn.commit()
+        print(f"✅ Inserted {len(data_to_insert)} records into token_transfers.")
 
-def insert_swaps(conn, swaps: List[Dict[str, Any]]):
-    """Batch inserts swap data into the dex_swaps table."""
+def insert_swaps(conn, block_number: int, swaps: List[Dict[str, Any]]):
+    """Write swaps to DB and/or CSV according to PIPELINE_SINK."""
     if not swaps:
         return
-    query = """
-        INSERT INTO dex_swaps (
-            transaction_hash, log_index, block_number, timestamp, chain,
-            pool_contract, token_in_contract, token_in_symbol, amount_in, usd_value_in,
-            token_out_contract, token_out_symbol, amount_out, usd_value_out
-        )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (transaction_hash, log_index) DO NOTHING;
-    """
-    data_to_insert = []
-    for s in swaps:
-        data_to_insert.append(
-            (
-                s['transactionHash'], int(s['logIndex']), int(s['blockNumber']), int(s['timestamp']), s.get('chain', CHAIN),
-                s['poolContract'], s['tokenInContract'], s.get('tokenInSymbol'),
-                Decimal(str(s.get('amountIn'))) if s.get('amountIn') is not None else None,
-                Decimal(str(s.get('usdValueIn'))) if s.get('usdValueIn') is not None else None,
-                s['tokenOutContract'], s.get('tokenOutSymbol'),
-                Decimal(str(s.get('amountOut'))) if s.get('amountOut') is not None else None,
-                Decimal(str(s.get('usdValueOut'))) if s.get('usdValueOut') is not None else None,
+    # CSV
+    if USE_CSV:
+        swaps_csv_path = os.path.join(OUTPUT_DIR, f'dex_swaps_{block_number}.csv')
+        write_csv(swaps_csv_path, swaps, CSV_COLUMNS_SWAPS)
+        print(f"📝 Wrote {len(swaps)} swap records to {swaps_csv_path}.")
+    # DB
+    if USE_DB and conn:
+        query = """
+            INSERT INTO dex_swaps (
+                transaction_hash, log_index, block_number, timestamp, chain,
+                pool_contract, token_in_contract, token_in_symbol, amount_in, usd_value_in,
+                token_out_contract, token_out_symbol, amount_out, usd_value_out
             )
-        )
-    with conn.cursor() as cursor:
-        execute_batch(cursor, query, data_to_insert)
-    conn.commit()
-    print(f"✅ Inserted {len(data_to_insert)} records into dex_swaps.")
-
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (transaction_hash, log_index) DO NOTHING;
+        """
+        data_to_insert = []
+        for s in swaps:
+            data_to_insert.append(
+                (
+                    s['transactionHash'],
+                    int(s['logIndex']),
+                    int(s['blockNumber']),
+                    int(s['timestamp']),
+                    s.get('chain', CHAIN),
+                    s['poolContract'],
+                    s['tokenInContract'],
+                    s.get('tokenInSymbol'),
+                    Decimal(str(s.get('amountIn'))) if s.get('amountIn') is not None else None,
+                    Decimal(str(s.get('usdValueIn'))) if s.get('usdValueIn') is not None else None,
+                    s['tokenOutContract'],
+                    s.get('tokenOutSymbol'),
+                    Decimal(str(s.get('amountOut'))) if s.get('amountOut') is not None else None,
+                    Decimal(str(s.get('usdValueOut'))) if s.get('usdValueOut') is not None else None,
+                )
+            )
+        with conn.cursor() as cursor:
+            execute_batch(cursor, query, data_to_insert)
+        conn.commit()
+        print(f"✅ Inserted {len(data_to_insert)} records into dex_swaps.")
 
 # --- DATA LOADING & MAPPING ---
 
@@ -252,9 +304,13 @@ def parse_and_enrich_transfers(block_data: Dict[str, Any]) -> List[Dict[str, Any
                     metadata = get_token_metadata(token_contract)
                     if not metadata: continue
 
-                    # Get historical price once per (token, date)
+                    # Get historical price once per (token, date) or defer
                     coingecko_id = ADDRESS_TO_ID_MAP.get(token_contract)
-                    price = get_historical_price(coingecko_id, date_str) if coingecko_id else None
+                    if DEFER_PRICES:
+                        enqueue_price_task(token_contract, date_str)
+                        price = None
+                    else:
+                        price = get_historical_price(coingecko_id, date_str) if coingecko_id else None
 
                     from_address = Web3.to_checksum_address('0x' + log['topics'][1][-40:])
                     to_address = Web3.to_checksum_address('0x' + log['topics'][2][-40:])
@@ -270,6 +326,12 @@ def parse_and_enrich_transfers(block_data: Dict[str, Any]) -> List[Dict[str, Any
                     block_number_hex = receipt.get('blockNumber')
                     block_number = int(block_number_hex, 16) if isinstance(block_number_hex, str) and block_number_hex.startswith('0x') else int(block_number_hex)
                     tx_hash = receipt['transactionHash']
+
+                    # Record token in registry for later joins/backfills
+                    try:
+                        upsert_token_registry(token_contract, metadata.get('symbol'), int(metadata.get('decimals', 18)), block_number, int(timestamp))
+                    except Exception:
+                        pass
 
                     enriched_transfers.append({
                         "blockNumber": block_number,
@@ -332,16 +394,72 @@ def get_historical_price(coingecko_id: Optional[str], date_str: str) -> Optional
         PRICE_CACHE[cache_key] = None
         return None
 
+def upsert_token_registry(token_contract: str, symbol: Optional[str], decimals: Optional[int], block_number: int, timestamp: int):
+    """Record token metadata to a registry CSV (append-only; de-dup later in batch jobs)."""
+    try:
+        rec = [{
+            'tokenContract': token_contract,
+            'symbol': symbol or '',
+            'decimals': decimals if decimals is not None else '',
+            'firstSeenBlock': block_number,
+            'firstSeenAt': timestamp,
+        }]
+        tokens_csv = os.path.join(OUTPUT_DIR, 'tokens.csv')
+        write_csv(tokens_csv, rec, CSV_COLUMNS_TOKENS)
+    except Exception as e:
+        print(f"⚠️ Failed to write token registry for {token_contract}: {e}")
+
+def enqueue_price_task(token_contract: str, date_str: str):
+    """Queue a (token, date) pair for later price backfill, deduped for the run."""
+    key = (token_contract.lower(), date_str)
+    if key in PRICE_TASKS_SET:
+        return
+    PRICE_TASKS_SET.add(key)
+    try:
+        rec = [{ 'tokenContract': token_contract, 'date': date_str }]
+        tasks_csv = os.path.join(OUTPUT_DIR, 'price_tasks.csv')
+        write_csv(tasks_csv, rec, CSV_COLUMNS_PRICE_TASKS)
+    except Exception as e:
+        print(f"⚠️ Failed to enqueue price task for {token_contract} @ {date_str}: {e}")
+
+def _serialize_value(v):
+    from decimal import Decimal as _D
+    if isinstance(v, _D):
+        return str(v)
+    return v
+
+def write_csv(file_path: str, records: list, columns: list, mode='a'):
+    """Append records to a CSV file with provided columns; create header if new."""
+    if not records:
+        return
+    import csv
+    is_new = not os.path.exists(file_path)
+    with open(file_path, mode, newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=columns)
+        if is_new:
+            writer.writeheader()
+        for r in records:
+            row = {c: _serialize_value(r.get(c)) for c in columns}
+            writer.writerow(row)
+
 def get_pool_tokens(pool_address: str) -> Optional[Dict[str, str]]:
     """Fetch and cache token0/token1 addresses for a given pool (V2/V3/Velodrome-like)."""
     if pool_address in POOL_TOKEN_CACHE:
         return POOL_TOKEN_CACHE[pool_address]
     try:
-        minimal_pool_abi = json.loads('[{"inputs":[],"name":"token0","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"token1","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"}]')
-        contract = w3.eth.contract(address=pool_address, abi=minimal_pool_abi)
-        t0 = contract.functions.token0().call()
-        t1 = contract.functions.token1().call()
-        res = { 'token0': Web3.to_checksum_address(t0), 'token1': Web3.to_checksum_address(t1) }
+        # Try standard Uniswap V2/V3 style token0/token1
+        abi_token01 = json.loads('[{"inputs":[],"name":"token0","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"token1","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"}]')
+        contract = w3.eth.contract(address=pool_address, abi=abi_token01)
+        try:
+            t0 = contract.functions.token0().call()
+            t1 = contract.functions.token1().call()
+            res = { 'token0': Web3.to_checksum_address(t0), 'token1': Web3.to_checksum_address(t1) }
+        except Exception:
+            # Fallback: Solidly/Aerodrome-style tokens() returning (token0, token1)
+            abi_tokens = json.loads('[{"inputs":[],"name":"tokens","outputs":[{"internalType":"address","name":"token0","type":"address"},{"internalType":"address","name":"token1","type":"address"}],"stateMutability":"view","type":"function"}]')
+            contract2 = w3.eth.contract(address=pool_address, abi=abi_tokens)
+            t0, t1 = contract2.functions.tokens().call()
+            res = { 'token0': Web3.to_checksum_address(t0), 'token1': Web3.to_checksum_address(t1) }
         POOL_TOKEN_CACHE[pool_address] = res
         return res
     except Exception:
@@ -353,20 +471,30 @@ def parse_and_enrich_swaps(block_data: Dict[str, Any]) -> List[Dict[str, Any]]:
     receipts = block_data.get('receipts', [])
     block_number = int(block_data.get('blockNumber'))
     # estimate date for pricing from block timestamp via first tx (fallback to today)
-    date_str = datetime.utcnow().strftime('%d-%m-%Y')
+    date_str = datetime.now(timezone.utc).strftime('%d-%m-%Y')
     swaps: List[Dict[str, Any]] = []
     try:
         # Best-effort fetch of block timestamp via eth_getBlockByNumber (fast, single call)
         b = w3.eth.get_block(block_number)
         block_ts = int(b.timestamp)
-        date_str = datetime.utcfromtimestamp(block_ts).strftime('%d-%m-%Y')
+        date_str = datetime.fromtimestamp(block_ts, timezone.utc).strftime('%d-%m-%Y')
     except Exception:
         pass
 
+    scanned_logs = 0
+    v2_matches = 0
+    v3_matches = 0
+    v2_shortdata = 0
+    v3_shortdata = 0
+    token_resolution_failures = 0
+    metadata_failures = 0
+    price_failures = 0
+    unexpected_errors = 0
     for receipt in receipts:
         tx_hash = receipt.get('transactionHash')
         logs = receipt.get('logs', [])
         for log in logs:
+            scanned_logs += 1
             try:
                 topic0 = log.get('topics', [None])[0]
                 addr = log.get('address')
@@ -382,17 +510,22 @@ def parse_and_enrich_swaps(block_data: Dict[str, Any]) -> List[Dict[str, Any]]:
                 log_index = int(log_index_hex, 16) if isinstance(log_index_hex, str) and log_index_hex.startswith('0x') else int(log_index_hex)
 
                 # Uniswap V2 / Velodrome / Solidly style
-                if topic0 == UNIV2_SWAP_TOPIC:
+                if topic0 == UNIV2_SWAP_TOPIC or topic0 == UNIV2_SWAP_TOPIC_ALT:
+                    v2_matches += 1
                     # data encodes: amount0In, amount1In, amount0Out, amount1Out (uint256 x4)
                     data_hex = log.get('data', '0x')
                     raw = bytes.fromhex(data_hex[2:]) if data_hex.startswith('0x') else bytes()
                     if len(raw) >= 32*4:
-                        amounts = w3.codec.decode_abi(['uint256','uint256','uint256','uint256'], raw)
+                        amounts = w3.codec.decode(['uint256','uint256','uint256','uint256'], raw)
                         amount0_in, amount1_in, amount0_out, amount1_out = [Decimal(int(x)) for x in amounts]
                     else:
+                        v2_shortdata += 1
+                        print(f"    V2 Swap data too short (len={len(raw)} bytes) for pool {pool_addr}; skipping")
                         continue
                     tokens = get_pool_tokens(pool_addr)
                     if not tokens:
+                        token_resolution_failures += 1
+                        print(f"    V2 swap match but tokens unavailable for pool {pool_addr}; skipping")
                         continue
                     token0 = tokens['token0']; token1 = tokens['token1']
                     # decide direction
@@ -403,23 +536,49 @@ def parse_and_enrich_swaps(block_data: Dict[str, Any]) -> List[Dict[str, Any]]:
                         token_in, token_out = token1, token0
                         amt_in, amt_out = amount1_in, amount0_out
 
-                    # metadata and normalization
-                    meta_in = get_token_metadata(token_in) or {}
-                    meta_out = get_token_metadata(token_out) or {}
-                    dec_in = int(meta_in.get('decimals', 18))
-                    dec_out = int(meta_out.get('decimals', 18))
-                    sym_in = meta_in.get('symbol')
-                    sym_out = meta_out.get('symbol')
+                    # metadata and normalization (resilient)
+                    sym_in = None; sym_out = None
+                    dec_in = 18; dec_out = 18
+                    try:
+                        meta_in = get_token_metadata(token_in) or {}
+                        meta_out = get_token_metadata(token_out) or {}
+                        dec_in = int(meta_in.get('decimals', 18))
+                        dec_out = int(meta_out.get('decimals', 18))
+                        sym_in = meta_in.get('symbol')
+                        sym_out = meta_out.get('symbol')
+                    except Exception as e:
+                        metadata_failures += 1
+                        print(f"    V2 metadata fetch failed for pool {pool_addr}: {e}")
                     norm_in = amt_in / (Decimal(10) ** dec_in) if amt_in is not None else None
                     norm_out = amt_out / (Decimal(10) ** dec_out) if amt_out is not None else None
 
-                    # USD valuation
-                    cg_in = ADDRESS_TO_ID_MAP.get(token_in)
-                    cg_out = ADDRESS_TO_ID_MAP.get(token_out)
-                    price_in = get_historical_price(cg_in, date_str)
-                    price_out = get_historical_price(cg_out, date_str)
-                    usd_in = (norm_in * Decimal(str(price_in))) if (norm_in is not None and price_in is not None) else None
-                    usd_out = (norm_out * Decimal(str(price_out))) if (norm_out is not None and price_out is not None) else None
+                    # Token registry upsert for both sides
+                    ts_val = int(b.timestamp) if 'b' in locals() else int(time.time())
+                    try:
+                        upsert_token_registry(token_in, sym_in, dec_in, block_number, ts_val)
+                        upsert_token_registry(token_out, sym_out, dec_out, block_number, ts_val)
+                    except Exception:
+                        pass
+
+                    # USD valuation (resilient) or deferred pricing
+                    usd_in = None; usd_out = None
+                    if DEFER_PRICES:
+                        try:
+                            enqueue_price_task(token_in, date_str)
+                            enqueue_price_task(token_out, date_str)
+                        except Exception:
+                            pass
+                    else:
+                        try:
+                            cg_in = ADDRESS_TO_ID_MAP.get(token_in)
+                            cg_out = ADDRESS_TO_ID_MAP.get(token_out)
+                            price_in = get_historical_price(cg_in, date_str)
+                            price_out = get_historical_price(cg_out, date_str)
+                            usd_in = (norm_in * Decimal(str(price_in))) if (norm_in is not None and price_in is not None) else None
+                            usd_out = (norm_out * Decimal(str(price_out))) if (norm_out is not None and price_out is not None) else None
+                        except Exception as e:
+                            price_failures += 1
+                            print(f"    V2 pricing fetch failed for pool {pool_addr}: {e}")
 
                     swaps.append({
                         'transactionHash': tx_hash,
@@ -440,17 +599,22 @@ def parse_and_enrich_swaps(block_data: Dict[str, Any]) -> List[Dict[str, Any]]:
 
                 # Uniswap V3 style
                 elif topic0 == UNIV3_SWAP_TOPIC:
+                    v3_matches += 1
                     data_hex = log.get('data', '0x')
                     raw = bytes.fromhex(data_hex[2:]) if data_hex.startswith('0x') else bytes()
                     if len(raw) >= 32*5:  # amounts and other fields
-                        # amount0 (int256), amount1 (int256) are first two
-                        amount0, amount1 = w3.codec.decode_abi(['int256','int256'], raw[:64*2])
-                        amount0 = Decimal(int(amount0))
-                        amount1 = Decimal(int(amount1))
+                        # Decode full tuple, then use first two values (amount0, amount1)
+                        decoded = w3.codec.decode(['int256','int256','uint160','uint128','int24'], raw)
+                        amount0 = Decimal(int(decoded[0]))
+                        amount1 = Decimal(int(decoded[1]))
                     else:
+                        v3_shortdata += 1
+                        print(f"    V3 Swap data too short (len={len(raw)} bytes) for pool {pool_addr}; skipping")
                         continue
                     tokens = get_pool_tokens(pool_addr)
                     if not tokens:
+                        token_resolution_failures += 1
+                        print(f"    V3 swap match but tokens unavailable for pool {pool_addr}; skipping")
                         continue
                     token0 = tokens['token0']; token1 = tokens['token1']
                     # In V3, positive amount means to the pool (in), negative means out from pool
@@ -461,21 +625,47 @@ def parse_and_enrich_swaps(block_data: Dict[str, Any]) -> List[Dict[str, Any]]:
                         token_in, token_out = token1, token0
                         amt_in, amt_out = amount1, -amount0
 
-                    meta_in = get_token_metadata(token_in) or {}
-                    meta_out = get_token_metadata(token_out) or {}
-                    dec_in = int(meta_in.get('decimals', 18))
-                    dec_out = int(meta_out.get('decimals', 18))
-                    sym_in = meta_in.get('symbol')
-                    sym_out = meta_out.get('symbol')
+                    sym_in = None; sym_out = None
+                    dec_in = 18; dec_out = 18
+                    try:
+                        meta_in = get_token_metadata(token_in) or {}
+                        meta_out = get_token_metadata(token_out) or {}
+                        dec_in = int(meta_in.get('decimals', 18))
+                        dec_out = int(meta_out.get('decimals', 18))
+                        sym_in = meta_in.get('symbol')
+                        sym_out = meta_out.get('symbol')
+                    except Exception as e:
+                        metadata_failures += 1
+                        print(f"    V3 metadata fetch failed for pool {pool_addr}: {e}")
                     norm_in = amt_in / (Decimal(10) ** dec_in) if amt_in is not None else None
                     norm_out = amt_out / (Decimal(10) ** dec_out) if amt_out is not None else None
 
-                    cg_in = ADDRESS_TO_ID_MAP.get(token_in)
-                    cg_out = ADDRESS_TO_ID_MAP.get(token_out)
-                    price_in = get_historical_price(cg_in, date_str)
-                    price_out = get_historical_price(cg_out, date_str)
-                    usd_in = (norm_in * Decimal(str(price_in))) if (norm_in is not None and price_in is not None) else None
-                    usd_out = (norm_out * Decimal(str(price_out))) if (norm_out is not None and price_out is not None) else None
+                    # Token registry upsert for both sides
+                    ts_val = int(b.timestamp) if 'b' in locals() else int(time.time())
+                    try:
+                        upsert_token_registry(token_in, sym_in, dec_in, block_number, ts_val)
+                        upsert_token_registry(token_out, sym_out, dec_out, block_number, ts_val)
+                    except Exception:
+                        pass
+
+                    usd_in = None; usd_out = None
+                    if DEFER_PRICES:
+                        try:
+                            enqueue_price_task(token_in, date_str)
+                            enqueue_price_task(token_out, date_str)
+                        except Exception:
+                            pass
+                    else:
+                        try:
+                            cg_in = ADDRESS_TO_ID_MAP.get(token_in)
+                            cg_out = ADDRESS_TO_ID_MAP.get(token_out)
+                            price_in = get_historical_price(cg_in, date_str)
+                            price_out = get_historical_price(cg_out, date_str)
+                            usd_in = (norm_in * Decimal(str(price_in))) if (norm_in is not None and price_in is not None) else None
+                            usd_out = (norm_out * Decimal(str(price_out))) if (norm_out is not None and price_out is not None) else None
+                        except Exception as e:
+                            price_failures += 1
+                            print(f"    V3 pricing fetch failed for pool {pool_addr}: {e}")
 
                     swaps.append({
                         'transactionHash': tx_hash,
@@ -494,9 +684,21 @@ def parse_and_enrich_swaps(block_data: Dict[str, Any]) -> List[Dict[str, Any]]:
                         'usdValueOut': usd_out,
                     })
 
-            except Exception:
+            except Exception as e:
+                unexpected_errors += 1
+                try:
+                    topic0_dbg = log.get('topics', [None])[0]
+                except Exception:
+                    topic0_dbg = None
+                print(f"    Unexpected error decoding swap log: pool={addr}, topic0={topic0_dbg}, err={e}")
                 continue
 
+    print(
+        f"Swaps scan summary for block {block_number}: "
+        f"scanned_logs={scanned_logs}, v2_topic_matches={v2_matches}, v3_topic_matches={v3_matches}, "
+        f"decoded_swaps={len(swaps)}, v2_shortdata={v2_shortdata}, v3_shortdata={v3_shortdata}, "
+        f"token_resolution_failures={token_resolution_failures}, metadata_failures={metadata_failures}, price_failures={price_failures}, unexpected_errors={unexpected_errors}"
+    )
     return swaps
 
 # --- MAIN EXECUTION ---
@@ -525,8 +727,8 @@ def set_last_processed_block(conn, chain: str, block_number: int) -> None:
 
 if __name__ == "__main__":
     build_address_to_id_map()
-    db_conn = get_db_connection()
-    if not db_conn:
+    db_conn = get_db_connection() if USE_DB else None
+    if USE_DB and not db_conn:
         exit()
 
     try:
@@ -534,11 +736,14 @@ if __name__ == "__main__":
         target_latest = max(0, latest_block_number - CONFIRMATIONS)
         print(f"\nLatest block on Base: {latest_block_number}. Target up to: {target_latest} (confirmations: {CONFIRMATIONS})")
 
-        start_block = get_last_processed_block(db_conn, CHAIN)
-        if start_block is None:
-            start_block = target_latest  # start from tip (no backfill on first run)
+        if USE_DB:
+            start_block = get_last_processed_block(db_conn, CHAIN)
+            if start_block is None:
+                start_block = target_latest  # start from tip (no backfill on first run)
+            else:
+                start_block = start_block + 1
         else:
-            start_block = start_block + 1
+            start_block = target_latest
 
         if start_block > target_latest:
             print("No new blocks to process.")
@@ -549,11 +754,14 @@ if __name__ == "__main__":
                     continue
                 enriched_transfers = parse_and_enrich_transfers(block_data)
                 if enriched_transfers:
-                    insert_transfers(db_conn, enriched_transfers)
+                    insert_transfers(db_conn, block_number, enriched_transfers)
                 enriched_swaps = parse_and_enrich_swaps(block_data)
                 if enriched_swaps:
-                    insert_swaps(db_conn, enriched_swaps)
-                set_last_processed_block(db_conn, CHAIN, block_number)
+                    insert_swaps(db_conn, block_number, enriched_swaps)
+                else:
+                    print("No swaps decoded for this block.")
+                if USE_DB:
+                    set_last_processed_block(db_conn, CHAIN, block_number)
                 print(f"Processed block {block_number}.")
 
         print("\nPipeline run complete.")
@@ -561,6 +769,6 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"\nAn unexpected error occurred: {e}")
     finally:
-        if db_conn:
+        if USE_DB and db_conn:
             db_conn.close()
             print("\nDatabase connection closed.")

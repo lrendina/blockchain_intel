@@ -6,3 +6,5 @@ test.ipynb
 coin_list.json
 ingest.ipynb
 postgres_data/
+output/
+block_data/

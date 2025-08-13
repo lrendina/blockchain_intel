@@ -1,4 +1,21 @@
 -- Blocks table - Partitioned by network
+-- Token registry table (append-only CSV can be periodically merged into this)
+CREATE TABLE IF NOT EXISTS tokens (
+    token_contract TEXT PRIMARY KEY,
+    symbol TEXT,
+    decimals INTEGER,
+    first_seen_block BIGINT,
+    first_seen_at BIGINT
+);
+
+-- Historical prices table (one price per token per date)
+CREATE TABLE IF NOT EXISTS prices (
+    token_contract TEXT NOT NULL,
+    date TEXT NOT NULL, -- format dd-mm-YYYY to align with CoinGecko history endpoint
+    usd NUMERIC,
+    PRIMARY KEY (token_contract, date)
+);
+
 CREATE TABLE IF NOT EXISTS blocks (
     chain VARCHAR(20) NOT NULL,
     block_number BIGINT NOT NULL,
